@@ -251,7 +251,10 @@ function App() {
               <strong>My workspace</strong>
               <span>Local account</span>
             </div>
-            <button className="icon-button profile-menu" aria-label="Workspace menu">
+            <button
+              className="icon-button profile-menu"
+              aria-label="Workspace menu"
+            >
               <MoreHorizontal size={17} />
             </button>
           </div>
@@ -389,8 +392,7 @@ function Welcome({
         <span className="orb-glow" />
       </div>
       <div className="eyebrow">
-        <span className="eyebrow-line" />
-        A QUIETER KIND OF AI
+        <span className="eyebrow-line" />A QUIETER KIND OF AI
         <span className="eyebrow-line" />
       </div>
       <h1>
@@ -495,7 +497,7 @@ function SettingsModal({
     providers: {
       title: 'Connect a provider',
       description:
-        "Your API keys stay on this device and are never shown again after saving.",
+        'Your API keys stay on this device and are never shown again after saving.',
     },
     models: {
       title: 'Model preferences',
@@ -575,8 +577,8 @@ function SettingsModal({
                   <Zap size={15} />
                 </span>
                 <p>
-                  Provider connections are not available in this build yet.
-                  Your credentials won&apos;t be collected or stored.
+                  Provider connections are not available in this build yet. Your
+                  credentials won&apos;t be collected or stored.
                 </p>
               </div>
             </>
