@@ -12,6 +12,7 @@ import {
   Search,
   Send,
   Settings,
+  Square,
   Sparkles,
   X,
   Zap,
@@ -21,16 +22,29 @@ import {
   type FormEvent,
   type KeyboardEvent,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
+import type {
+  Provider,
+  ProviderKind,
+  ProviderSettings,
+  SaveProviderInput,
+} from './shared/provider-contracts';
+import type { AgentEvent, ChatPromptMessage } from './shared/chat-contracts';
 import type { ChatMessage } from './stores/chat-store';
 import { useChatStore } from './stores/chat-store';
 import './index.css';
 
 type SettingsTab = 'providers' | 'models' | 'general';
+type ActiveChatRun = {
+  runId: string;
+  conversationId: string;
+  assistantMessageId: string;
+};
 
 const suggestions = [
   {
@@ -63,16 +77,39 @@ const suggestions = [
   },
 ];
 
-const providers = [
-  { name: 'Google Gemini', detail: 'Gemini models', logo: 'G', tone: 'google' },
-  { name: 'Groq', detail: 'Fast inference', logo: '◈', tone: 'groq' },
+const providerKinds: {
+  kind: ProviderKind;
+  name: string;
+  defaultModel: string;
+}[] = [
+  { kind: 'google', name: 'Google Gemini', defaultModel: 'gemini-2.5-flash' },
+  { kind: 'groq', name: 'Groq', defaultModel: 'llama-3.3-70b-versatile' },
   {
-    name: 'OpenAI compatible',
-    detail: 'OpenAI, OpenRouter, custom APIs',
-    logo: '✳',
-    tone: 'openai',
+    kind: 'openrouter',
+    name: 'OpenRouter',
+    defaultModel: 'openai/gpt-4o-mini',
+  },
+  { kind: 'openai', name: 'OpenAI', defaultModel: 'gpt-4o-mini' },
+  {
+    kind: 'anthropic',
+    name: 'Anthropic',
+    defaultModel: 'claude-3-7-sonnet-latest',
+  },
+  {
+    kind: 'custom',
+    name: 'OpenAI-compatible',
+    defaultModel: '',
   },
 ];
+
+const initialProviderSettings: ProviderSettings = {
+  providers: [],
+  selectedProviderId: null,
+};
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : 'Something went wrong.';
+}
 
 function getConversationTitle(
   conversation: { messages: ChatMessage[] } | undefined,
@@ -98,13 +135,26 @@ function App() {
   const [input, setInput] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('providers');
+  const [providerSettings, setProviderSettings] = useState<ProviderSettings>(
+    initialProviderSettings,
+  );
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsError, setSettingsError] = useState('');
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [toast, setToast] = useState('');
+  const [activeRun, setActiveRun] = useState<ActiveChatRun | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const messageRef = useRef<HTMLTextAreaElement>(null);
   const chatRef = useRef<HTMLElement>(null);
+  const activeRunRef = useRef<ActiveChatRun | null>(null);
 
   const activeConversation = conversations.find(
     (conversation) => conversation.id === activeId,
+  );
+  const selectedProviderId =
+    activeConversation?.providerId ?? providerSettings.selectedProviderId;
+  const selectedProvider = providerSettings.providers.find(
+    (provider) => provider.id === selectedProviderId && provider.enabled,
   );
   const visibleConversations = useMemo(
     () =>
@@ -123,6 +173,17 @@ function App() {
       chatRef.current.scrollTop = chatRef.current.scrollHeight;
     }
   }, [activeId, activeConversation?.messages.length, hasMessages]);
+
+  useLayoutEffect(() => {
+    const textarea = messageRef.current;
+    if (!textarea) return;
+    const maxHeight = 160;
+    textarea.style.height = 'auto';
+    textarea.style.overflowY = 'hidden';
+    const contentHeight = textarea.scrollHeight;
+    textarea.style.height = `${Math.min(contentHeight, maxHeight)}px`;
+    textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+  }, [input]);
 
   useEffect(() => {
     function handleShortcuts(event: globalThis.KeyboardEvent) {
@@ -147,22 +208,172 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  function showSettings() {
+  useEffect(() => {
+    function handleAgentEvent(event: AgentEvent) {
+      const run = activeRunRef.current;
+      if (!run || run.runId !== event.runId) return;
+      const store = useChatStore.getState();
+      switch (event.type) {
+        case 'message-started':
+          break;
+        case 'text-delta':
+          store.appendAssistantDelta(
+            event.conversationId,
+            event.assistantMessageId,
+            event.delta,
+          );
+          break;
+        case 'message-completed':
+          store.completeAssistantMessage(
+            event.conversationId,
+            event.assistantMessageId,
+          );
+          activeRunRef.current = null;
+          setActiveRun(null);
+          break;
+        case 'error':
+          store.failAssistantMessage(
+            event.conversationId,
+            event.assistantMessageId,
+            event.message,
+          );
+          activeRunRef.current = null;
+          setActiveRun(null);
+          break;
+        case 'generation-cancelled':
+          store.cancelAssistantMessage(
+            event.conversationId,
+            event.assistantMessageId,
+          );
+          activeRunRef.current = null;
+          setActiveRun(null);
+          break;
+      }
+    }
+
+    return window.chanakya.chat.subscribe(handleAgentEvent);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    window.chanakya.providers
+      .list()
+      .then((settings) => {
+        if (active) setProviderSettings(settings);
+      })
+      .catch((error: unknown) => {
+        if (active) setSettingsError(getErrorMessage(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function showSettings() {
     setSettingsOpen(true);
+    setSettingsLoading(true);
+    setSettingsError('');
+    try {
+      setProviderSettings(await window.chanakya.providers.list());
+    } catch (error) {
+      setSettingsError(getErrorMessage(error));
+    } finally {
+      setSettingsLoading(false);
+    }
   }
 
-  function sendMessage(event: FormEvent<HTMLFormElement>) {
+  async function chooseProvider(providerId: string | null) {
+    try {
+      const settings = await window.chanakya.providers.select(providerId);
+      setProviderSettings(settings);
+      if (activeId && providerId) {
+        const provider = settings.providers.find(
+          (item) => item.id === providerId,
+        );
+        if (provider) {
+          useChatStore.getState().setConversationProvider(activeId, provider);
+        }
+      }
+      setModelMenuOpen(false);
+    } catch (error) {
+      setToast(getErrorMessage(error));
+    }
+  }
+
+  async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!input.trim()) return;
-    submitMessage(input);
+    if (!input.trim() || activeRunRef.current) return;
+    const submitted = submitMessage(
+      input,
+      selectedProvider
+        ? { id: selectedProvider.id, model: selectedProvider.model }
+        : null,
+    );
     setInput('');
     if (messageRef.current) messageRef.current.style.height = 'auto';
+    if (!submitted || !selectedProvider) return;
+
+    const run: ActiveChatRun = {
+      runId: crypto.randomUUID(),
+      conversationId: submitted.conversationId,
+      assistantMessageId: submitted.assistantMessageId,
+    };
+    activeRunRef.current = run;
+    setActiveRun(run);
+    try {
+      const conversation = useChatStore
+        .getState()
+        .conversations.find((item) => item.id === submitted.conversationId);
+      const messages =
+        conversation?.messages
+          .filter(
+            (message) =>
+              message.id !== submitted.assistantMessageId &&
+              (message.role === 'user' ||
+                message.role === 'assistant' ||
+                message.role === 'system') &&
+              message.status !== 'error' &&
+              message.status !== 'cancelled' &&
+              message.content.length > 0,
+          )
+          .map(
+            (message): ChatPromptMessage => ({
+              role: message.role === 'user' ? 'user' : 'assistant',
+              content: message.content,
+            }),
+          ) ?? [];
+      await window.chanakya.chat.sendMessage({
+        ...run,
+        providerId: selectedProvider.id,
+        messages,
+      });
+    } catch (error) {
+      useChatStore
+        .getState()
+        .failAssistantMessage(
+          run.conversationId,
+          run.assistantMessageId,
+          getErrorMessage(error),
+        );
+      if (activeRunRef.current?.runId === run.runId) {
+        activeRunRef.current = null;
+        setActiveRun(null);
+      }
+    }
+  }
+
+  async function stopGeneration() {
+    const run = activeRunRef.current;
+    if (!run) return;
+    try {
+      await window.chanakya.chat.cancelRun(run.runId);
+    } catch (error) {
+      setToast(getErrorMessage(error));
+    }
   }
 
   function handleInput(event: ChangeEvent<HTMLTextAreaElement>) {
     setInput(event.currentTarget.value);
-    event.currentTarget.style.height = 'auto';
-    event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 160)}px`;
   }
 
   function handleInputKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -271,7 +482,11 @@ function App() {
           <div className="topbar-right">
             <div className="connection-state">
               <span className="state-dot" />
-              <span>No provider connected</span>
+              <span>
+                {selectedProvider
+                  ? `Using ${selectedProvider.name}`
+                  : 'No model selected'}
+              </span>
             </div>
             <button className="topbar-settings" onClick={showSettings}>
               <Settings size={16} />
@@ -292,7 +507,7 @@ function App() {
             <div className="message-list">
               {activeConversation?.messages.map((message, index) => (
                 <Message
-                  key={`${activeId}-${index}`}
+                  key={message.id ?? `${activeId}-${index}`}
                   message={message}
                   onOpenSettings={showSettings}
                 />
@@ -333,23 +548,74 @@ function App() {
                 <button
                   type="button"
                   className="model-picker"
-                  onClick={showSettings}
+                  onClick={() => setModelMenuOpen((open) => !open)}
+                  aria-expanded={modelMenuOpen}
                 >
-                  <Circle className="model-dot" size={8} />
-                  <span>No model selected</span>
+                  <Circle
+                    className={`model-dot${selectedProvider ? ' selected' : ''}`}
+                    size={8}
+                  />
+                  <span>
+                    {selectedProvider
+                      ? `${selectedProvider.name} · ${selectedProvider.model}`
+                      : 'No model selected'}
+                  </span>
                   <ChevronDown size={14} />
                 </button>
+                {modelMenuOpen && (
+                  <div className="model-dropdown" role="menu">
+                    {providerSettings.providers
+                      .filter((provider) => provider.enabled)
+                      .map((provider) => (
+                        <button
+                          className="model-option"
+                          key={provider.id}
+                          onClick={() => void chooseProvider(provider.id)}
+                          role="menuitem"
+                        >
+                          <span>{provider.name}</span>
+                          <small>{provider.model}</small>
+                          {provider.id === selectedProviderId && (
+                            <span className="model-current">Current</span>
+                          )}
+                        </button>
+                      ))}
+                    <button
+                      className="model-configure"
+                      onClick={() => {
+                        setModelMenuOpen(false);
+                        void showSettings();
+                      }}
+                    >
+                      <Plus size={14} /> Configure providers
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="composer-actions">
-                <span className="enter-hint">Enter to send</span>
-                <button
-                  type="submit"
-                  className="send-button"
-                  aria-label="Send message"
-                  title="Send message"
-                >
-                  <Send size={17} />
-                </button>
+                {activeRun ? (
+                  <button
+                    type="button"
+                    className="send-button stop-button"
+                    aria-label="Stop generation"
+                    title="Stop generation"
+                    onClick={() => void stopGeneration()}
+                  >
+                    <Square size={13} fill="currentColor" />
+                  </button>
+                ) : (
+                  <>
+                    <span className="enter-hint">Enter to send</span>
+                    <button
+                      type="submit"
+                      className="send-button"
+                      aria-label="Send message"
+                      title="Send message"
+                    >
+                      <Send size={17} />
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           </form>
@@ -362,11 +628,13 @@ function App() {
       {settingsOpen && (
         <SettingsModal
           activeTab={settingsTab}
+          settings={providerSettings}
+          loading={settingsLoading}
+          error={settingsError}
           onClose={() => setSettingsOpen(false)}
-          onConnect={() =>
-            setToast('Provider setup is not available in this build.')
-          }
           onSelectTab={setSettingsTab}
+          onSettingsChange={setProviderSettings}
+          onSelectProvider={(providerId) => void chooseProvider(providerId)}
         />
       )}
       <div className={`toast${toast ? ' visible' : ''}`} role="status">
@@ -465,18 +733,34 @@ function Message({
       </div>
       <div className="message-content">
         <div className="message-meta">
-          Chanakya <span className="error-label">Setup needed</span>
+          Chanakya
+          {message.status === 'streaming' && (
+            <span className="streaming-label">Generating</span>
+          )}
         </div>
-        <div className="message-error">
-          <strong>Connect a provider to get a response.</strong>
-          <p>
-            Your message is saved on this device. Open Settings to configure an
-            AI provider when provider connections are available.
-          </p>
-          <button className="inline-settings" onClick={onOpenSettings}>
-            <Settings size={14} /> Open settings
-          </button>
-        </div>
+        {message.content && <p className="assistant-text">{message.content}</p>}
+        {message.status === 'streaming' && !message.content && (
+          <div className="streaming-indicator">
+            <span />
+            <span />
+            <span />
+            <small>Thinking</small>
+          </div>
+        )}
+        {message.status === 'error' && (
+          <div className="message-error">
+            <strong>Couldn&apos;t generate a response.</strong>
+            <p>{message.error}</p>
+            {message.error?.includes('model is selected') && (
+              <button className="inline-settings" onClick={onOpenSettings}>
+                <Settings size={14} /> Open settings
+              </button>
+            )}
+          </div>
+        )}
+        {message.status === 'cancelled' && (
+          <div className="generation-cancelled">{message.error}</div>
+        )}
       </div>
     </article>
   );
@@ -484,32 +768,61 @@ function Message({
 
 function SettingsModal({
   activeTab,
+  settings,
+  loading,
+  error,
   onClose,
-  onConnect,
   onSelectTab,
+  onSettingsChange,
+  onSelectProvider,
 }: {
   activeTab: SettingsTab;
+  settings: ProviderSettings;
+  loading: boolean;
+  error: string;
   onClose: () => void;
-  onConnect: () => void;
   onSelectTab: (tab: SettingsTab) => void;
+  onSettingsChange: (settings: ProviderSettings) => void;
+  onSelectProvider: (providerId: string) => void;
 }) {
-  const content = {
-    providers: {
-      title: 'Connect a provider',
-      description:
-        'Your API keys stay on this device and are never shown again after saving.',
-    },
-    models: {
-      title: 'Model preferences',
-      description:
-        'These preferences will be available when settings support is connected.',
-    },
-    general: {
-      title: 'General preferences',
-      description:
-        'These preferences will be available when settings support is connected.',
-    },
-  }[activeTab];
+  const [creating, setCreating] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [actionError, setActionError] = useState('');
+
+  async function saveProvider(input: SaveProviderInput) {
+    setSaving(true);
+    setActionError('');
+    try {
+      onSettingsChange(await window.chanakya.providers.save(input));
+      setCreating(false);
+      setEditingProvider(null);
+    } catch (saveError) {
+      setActionError(getErrorMessage(saveError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeProvider(providerId: string) {
+    setActionError('');
+    try {
+      onSettingsChange(await window.chanakya.providers.delete(providerId));
+    } catch (removeError) {
+      setActionError(getErrorMessage(removeError));
+    }
+  }
+
+  async function updateEnabled(provider: Provider, enabled: boolean) {
+    setActionError('');
+    try {
+      onSettingsChange(
+        await window.chanakya.providers.setEnabled(provider.id, enabled),
+      );
+    } catch (updateError) {
+      setActionError(getErrorMessage(updateError));
+    }
+  }
 
   return (
     <div
@@ -549,49 +862,402 @@ function SettingsModal({
           ))}
         </div>
         <div className="settings-content">
-          <div className="settings-intro">
-            <h3>{content.title}</h3>
-            <p>{content.description}</p>
-          </div>
           {activeTab === 'providers' && (
-            <>
-              <div className="provider-list">
-                {providers.map((provider) => (
-                  <div className="provider-card" key={provider.name}>
-                    <span className={`provider-logo ${provider.tone}`}>
-                      {provider.logo}
-                    </span>
-                    <span className="provider-info">
-                      <strong>{provider.name}</strong>
-                      <small>{provider.detail}</small>
-                    </span>
-                    <span className="provider-status">Not connected</span>
-                    <button className="provider-connect" onClick={onConnect}>
-                      Connect
-                    </button>
-                  </div>
-                ))}
+            <section className="settings-section">
+              <div className="settings-intro">
+                <div>
+                  <h3>Provider configurations</h3>
+                  <p>
+                    API keys are encrypted with your operating system&apos;s
+                    secure credential storage. Saved keys are never sent back to
+                    the UI.
+                  </p>
+                </div>
+                <button
+                  className="provider-connect add-provider"
+                  onClick={() => {
+                    setActionError('');
+                    setEditingProvider(null);
+                    setCreating(true);
+                  }}
+                >
+                  <Plus size={14} /> Add provider
+                </button>
               </div>
-              <div className="settings-notice">
-                <span>
-                  <Zap size={15} />
-                </span>
+              {(error || actionError) && (
+                <div className="settings-error">{actionError || error}</div>
+              )}
+              {loading ? (
+                <div className="settings-loading">Loading providers…</div>
+              ) : settings.providers.length === 0 && !creating ? (
+                <div className="provider-empty">
+                  <Sparkles size={18} />
+                  <strong>No providers configured</strong>
+                  <span>Add a provider to choose a model.</span>
+                </div>
+              ) : (
+                <div className="provider-list">
+                  {settings.providers.map((provider) => (
+                    <div className="provider-card" key={provider.id}>
+                      <div className="provider-card-main">
+                        <span className={`provider-logo ${provider.kind}`}>
+                          {providerKinds
+                            .find((item) => item.kind === provider.kind)
+                            ?.name.slice(0, 1) ?? 'P'}
+                        </span>
+                        <span className="provider-info">
+                          <strong>{provider.name}</strong>
+                          <small>{provider.model}</small>
+                        </span>
+                        <span className="provider-status">
+                          {!provider.enabled
+                            ? 'Disabled'
+                            : provider.hasApiKey
+                              ? 'Key saved'
+                              : 'No API key'}
+                        </span>
+                      </div>
+                      <div className="provider-actions">
+                        <button
+                          className="provider-action"
+                          onClick={() => onSelectProvider(provider.id)}
+                          disabled={
+                            !provider.enabled ||
+                            settings.selectedProviderId === provider.id
+                          }
+                        >
+                          {settings.selectedProviderId === provider.id
+                            ? 'Selected'
+                            : 'Use model'}
+                        </button>
+                        <button
+                          className="provider-action"
+                          onClick={() => {
+                            setActionError('');
+                            setCreating(false);
+                            setEditingProvider(provider);
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="provider-action"
+                          onClick={() =>
+                            void updateEnabled(provider, !provider.enabled)
+                          }
+                        >
+                          {provider.enabled ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          className="provider-action danger"
+                          onClick={() => void removeProvider(provider.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {(creating || editingProvider) && (
+                <ProviderForm
+                  provider={editingProvider ?? undefined}
+                  saving={saving}
+                  error={actionError}
+                  onCancel={() => {
+                    setCreating(false);
+                    setEditingProvider(null);
+                    setActionError('');
+                  }}
+                  onSave={saveProvider}
+                />
+              )}
+            </section>
+          )}
+          {activeTab === 'models' && (
+            <section className="settings-section">
+              <div className="settings-intro">
+                <h3>Choose a model</h3>
                 <p>
-                  Provider connections are not available in this build yet. Your
-                  credentials won&apos;t be collected or stored.
+                  Select a configured provider and model for new conversations.
                 </p>
               </div>
-            </>
+              {error && <div className="settings-error">{error}</div>}
+              {settings.providers.filter((provider) => provider.enabled)
+                .length === 0 ? (
+                <div className="provider-empty">
+                  <span>No enabled models yet.</span>
+                  <button
+                    className="inline-settings"
+                    onClick={() => onSelectTab('providers')}
+                  >
+                    Configure a provider
+                  </button>
+                </div>
+              ) : (
+                <div className="model-settings-list">
+                  {settings.providers
+                    .filter((provider) => provider.enabled)
+                    .map((provider) => (
+                      <button
+                        className={`model-setting-option${settings.selectedProviderId === provider.id ? ' active' : ''}`}
+                        key={provider.id}
+                        onClick={() => onSelectProvider(provider.id)}
+                      >
+                        <span className="model-setting-copy">
+                          <strong>{provider.name}</strong>
+                          <small>{provider.model}</small>
+                        </span>
+                        <span className="model-setting-status">
+                          {settings.selectedProviderId === provider.id
+                            ? 'Current model'
+                            : 'Select'}
+                        </span>
+                      </button>
+                    ))}
+                </div>
+              )}
+            </section>
+          )}
+          {activeTab === 'general' && (
+            <section className="settings-section">
+              <div className="settings-intro">
+                <h3>Local data</h3>
+                <p>
+                  Conversations are saved in this app on this device. Provider
+                  credentials are stored separately using OS encryption.
+                </p>
+              </div>
+            </section>
           )}
         </div>
         <div className="modal-footer">
-          <span>Conversations are saved on this device</span>
+          <span>API keys are encrypted by your operating system</span>
           <button className="done-button" onClick={onClose}>
             Done
           </button>
         </div>
       </section>
     </div>
+  );
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every((item) => typeof item === 'string')
+  );
+}
+
+function ProviderForm({
+  provider,
+  saving,
+  error,
+  onCancel,
+  onSave,
+}: {
+  provider?: Provider;
+  saving: boolean;
+  error: string;
+  onCancel: () => void;
+  onSave: (input: SaveProviderInput) => Promise<void>;
+}) {
+  const initialKind = provider?.kind ?? 'google';
+  const defaults = providerKinds.find((item) => item.kind === initialKind);
+  const [kind, setKind] = useState<ProviderKind>(initialKind);
+  const [name, setName] = useState(provider?.name ?? defaults?.name ?? '');
+  const [model, setModel] = useState(
+    provider?.model ?? defaults?.defaultModel ?? '',
+  );
+  const [apiKey, setApiKey] = useState('');
+  const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '');
+  const [customHeaders, setCustomHeaders] = useState('');
+  const [enabled, setEnabled] = useState(provider?.enabled ?? true);
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(
+    provider?.allowPrivateNetwork ?? false,
+  );
+  const [formError, setFormError] = useState('');
+
+  function changeKind(nextKind: ProviderKind) {
+    const nextDefaults = providerKinds.find((item) => item.kind === nextKind);
+    setKind(nextKind);
+    setName(nextDefaults?.name ?? '');
+    setModel(nextDefaults?.defaultModel ?? '');
+    if (nextKind !== 'custom') setBaseUrl('');
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFormError('');
+    let parsedHeaders: Record<string, string> | undefined;
+    if (customHeaders.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(customHeaders);
+        if (!isStringRecord(parsed)) {
+          setFormError(
+            'Custom headers must be a JSON object with string values.',
+          );
+          return;
+        }
+        parsedHeaders = parsed;
+      } catch {
+        setFormError('Enter custom headers as valid JSON.');
+        return;
+      }
+    }
+
+    const input: SaveProviderInput = {
+      ...(provider ? { id: provider.id } : {}),
+      kind,
+      name,
+      model,
+      enabled,
+      allowPrivateNetwork,
+      ...(kind === 'custom' ? { baseUrl } : {}),
+      ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+      ...(parsedHeaders ? { customHeaders: parsedHeaders } : {}),
+    };
+    await onSave(input);
+  }
+
+  return (
+    <form className="provider-form" onSubmit={submit}>
+      <div className="provider-form-heading">
+        <div>
+          <span className="modal-kicker">
+            {provider ? 'EDIT PROVIDER' : 'NEW PROVIDER'}
+          </span>
+          <h3>{provider ? 'Update configuration' : 'Add a provider'}</h3>
+        </div>
+        <button
+          type="button"
+          className="icon-button modal-close"
+          onClick={onCancel}
+          aria-label="Close provider form"
+        >
+          <X size={16} />
+        </button>
+      </div>
+      <label className="settings-field">
+        Provider
+        <select
+          value={kind}
+          onChange={(event) => changeKind(event.target.value as ProviderKind)}
+        >
+          {providerKinds.map((option) => (
+            <option value={option.kind} key={option.kind}>
+              {option.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="provider-form-grid">
+        <label className="settings-field">
+          Display name
+          <input
+            required
+            maxLength={80}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="My provider"
+          />
+        </label>
+        <label className="settings-field">
+          Model identifier
+          <input
+            required
+            maxLength={160}
+            value={model}
+            onChange={(event) => setModel(event.target.value)}
+            placeholder="e.g. gemini-2.5-flash"
+          />
+        </label>
+      </div>
+      {kind === 'custom' && (
+        <>
+          <label className="settings-field">
+            API base URL
+            <input
+              required
+              type="url"
+              maxLength={2048}
+              value={baseUrl}
+              onChange={(event) => setBaseUrl(event.target.value)}
+              placeholder="https://api.example.com/v1"
+            />
+          </label>
+          <label className="private-network-option">
+            <input
+              type="checkbox"
+              checked={allowPrivateNetwork}
+              onChange={(event) => setAllowPrivateNetwork(event.target.checked)}
+            />
+            <span>
+              Allow a local/private network endpoint
+              <small>
+                Only enable this for a self-hosted endpoint you trust.
+              </small>
+            </span>
+          </label>
+        </>
+      )}
+      <label className="settings-field">
+        API key {provider?.hasApiKey && <span>(saved securely)</span>}
+        <input
+          type="password"
+          autoComplete="new-password"
+          value={apiKey}
+          onChange={(event) => setApiKey(event.target.value)}
+          placeholder={
+            provider?.hasApiKey
+              ? 'Saved securely · leave blank to keep'
+              : kind === 'custom'
+                ? 'Optional for local endpoints'
+                : 'Paste your API key'
+          }
+          required={!provider?.hasApiKey && kind !== 'custom'}
+        />
+      </label>
+      <label className="settings-field">
+        Custom headers (optional JSON)
+        <textarea
+          rows={2}
+          value={customHeaders}
+          onChange={(event) => setCustomHeaders(event.target.value)}
+          placeholder={
+            provider?.hasCustomHeaders
+              ? 'Saved securely · leave blank to keep, enter {} to clear'
+              : '{"X-Provider-Header": "value"}'
+          }
+        />
+      </label>
+      <label className="private-network-option enabled-option">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => setEnabled(event.target.checked)}
+        />
+        <span>Enable this provider</span>
+      </label>
+      {(formError || error) && (
+        <div className="settings-error">{formError || error}</div>
+      )}
+      <div className="provider-form-actions">
+        <button
+          type="button"
+          className="provider-action"
+          onClick={onCancel}
+          disabled={saving}
+        >
+          Cancel
+        </button>
+        <button type="submit" className="done-button" disabled={saving}>
+          {saving ? 'Saving…' : 'Save provider'}
+        </button>
+      </div>
+    </form>
   );
 }
 

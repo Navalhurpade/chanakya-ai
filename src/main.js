@@ -1,6 +1,9 @@
 import { app, BrowserWindow } from 'electron';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import started from 'electron-squirrel-startup';
+import { registerChatIpc } from './main/chat-ipc';
+import { registerProviderIpc } from './main/provider-ipc';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -8,6 +11,10 @@ if (started) {
 }
 
 const createWindow = () => {
+  const indexPath = path.join(
+    __dirname,
+    `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`,
+  );
   const mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -21,13 +28,19 @@ const createWindow = () => {
       nodeIntegration: false,
     },
   });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, destination) => {
+    const allowed = MAIN_WINDOW_VITE_DEV_SERVER_URL
+      ? new URL(destination).origin ===
+        new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).origin
+      : destination === pathToFileURL(indexPath).href;
+    if (!allowed) event.preventDefault();
+  });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
   } else {
-    mainWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
+    mainWindow.loadFile(indexPath);
   }
 };
 
@@ -35,6 +48,31 @@ const createWindow = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
+  const isTrustedRendererSender = (senderId) => {
+    const window = BrowserWindow.getAllWindows().find(
+      (candidate) => candidate.webContents.id === senderId,
+    );
+    if (!window) return false;
+    const currentUrl = window.webContents.getURL();
+    if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+      try {
+        return (
+          new URL(currentUrl).origin ===
+          new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).origin
+        );
+      } catch {
+        return false;
+      }
+    }
+    return (
+      currentUrl ===
+      pathToFileURL(
+        path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
+      ).href
+    );
+  };
+  registerProviderIpc(isTrustedRendererSender);
+  registerChatIpc(isTrustedRendererSender);
   createWindow();
 
   // On OS X it's common to re-create a window in the app when the
