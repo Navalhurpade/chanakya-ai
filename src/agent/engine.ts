@@ -10,8 +10,6 @@ export async function generateResponse(
     onTextDelta: (delta: string) => void;
   },
 ) {
-  console.log({ provider });
-
   const result = streamText({
     model: getLanguageModel(provider),
     messages,

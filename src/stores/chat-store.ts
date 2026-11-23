@@ -26,40 +26,25 @@ type ChatStore = {
   activeId: string | null;
   startNewConversation: () => void;
   selectConversation: (id: string) => void;
-  setConversationProvider: (
-    conversationId: string,
-    provider: SelectedProvider,
-  ) => void;
+  setConversationProvider: (conversationId: string, provider: SelectedProvider) => void;
   submitMessage: (
     content: string,
     provider: SelectedProvider | null,
   ) => { conversationId: string; assistantMessageId: string } | null;
-  appendAssistantDelta: (
-    conversationId: string,
-    messageId: string,
-    delta: string,
-  ) => void;
+  appendAssistantDelta: (conversationId: string, messageId: string, delta: string) => void;
   completeAssistantMessage: (conversationId: string, messageId: string) => void;
-  failAssistantMessage: (
-    conversationId: string,
-    messageId: string,
-    error: string,
-  ) => void;
+  failAssistantMessage: (conversationId: string, messageId: string, error: string) => void;
   cancelAssistantMessage: (conversationId: string, messageId: string) => void;
+  deleteConversation: (conversationId: string) => void;
 };
 
 function readLegacyConversations(): Conversation[] {
   try {
-    const saved: unknown = JSON.parse(
-      localStorage.getItem('chanakya-conversations-v1') ?? '[]',
-    );
+    const saved: unknown = JSON.parse(localStorage.getItem('chanakya-conversations-v1') ?? '[]');
     if (!Array.isArray(saved)) return [];
     return saved.filter(
       (item): item is Conversation =>
-        typeof item === 'object' &&
-        item !== null &&
-        typeof item.id === 'string' &&
-        Array.isArray(item.messages),
+        typeof item === 'object' && item !== null && typeof item.id === 'string' && Array.isArray(item.messages),
     );
   } catch {
     return [];
@@ -96,9 +81,7 @@ export const useChatStore = create<ChatStore>()(
 
           const id = state.activeId ?? crypto.randomUUID();
           const assistantMessageId = crypto.randomUUID();
-          const current = state.conversations.find(
-            (conversation) => conversation.id === id,
-          ) ?? {
+          const current = state.conversations.find((conversation) => conversation.id === id) ?? {
             id,
             model: provider?.model ?? null,
             ...(provider ? { providerId: provider.id } : {}),
@@ -106,9 +89,7 @@ export const useChatStore = create<ChatStore>()(
           };
           const nextConversation: Conversation = {
             ...current,
-            ...(provider
-              ? { providerId: provider.id, model: provider.model }
-              : {}),
+            ...(provider ? { providerId: provider.id, model: provider.model } : {}),
             messages: [
               ...current.messages,
               { id: crypto.randomUUID(), role: 'user', content: text },
@@ -119,8 +100,7 @@ export const useChatStore = create<ChatStore>()(
                 status: provider ? 'streaming' : 'error',
                 ...(!provider
                   ? {
-                      error:
-                        'No model is selected. Choose a provider from the model menu.',
+                      error: 'No model is selected. Choose a provider from the model menu.',
                     }
                   : {}),
               },
@@ -130,12 +110,7 @@ export const useChatStore = create<ChatStore>()(
           result = { conversationId: id, assistantMessageId };
           return {
             activeId: id,
-            conversations: [
-              nextConversation,
-              ...state.conversations.filter(
-                (conversation) => conversation.id !== id,
-              ),
-            ],
+            conversations: [nextConversation, ...state.conversations.filter((conversation) => conversation.id !== id)],
           };
         });
         return result;
@@ -177,9 +152,7 @@ export const useChatStore = create<ChatStore>()(
               ? {
                   ...conversation,
                   messages: conversation.messages.map((message) =>
-                    message.id === messageId
-                      ? { ...message, status: 'error', error }
-                      : message,
+                    message.id === messageId ? { ...message, status: 'error', error } : message,
                   ),
                 }
               : conversation,
@@ -203,6 +176,10 @@ export const useChatStore = create<ChatStore>()(
                 }
               : conversation,
           ),
+        })),
+      deleteConversation: (conversationId) =>
+        set((state) => ({
+          conversations: state.conversations.filter((c) => c.id !== conversationId),
         })),
     }),
     {
