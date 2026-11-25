@@ -1,10 +1,13 @@
+import './main/load-env';
 import { app, BrowserWindow } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import started from 'electron-squirrel-startup';
-import { createAgentService } from './agent/agent-service';
+import { createAgentService } from './ai/agent-service';
 import { registerChatIpc } from './main/chat-ipc';
 import { loadProviderForChat, registerProviderIpc } from './main/provider-ipc';
+import { DesktopTerminalRuntime } from './main/terminal-runtime';
+import { registerTerminalIpc } from './main/terminal-ipc';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -72,9 +75,11 @@ app.whenReady().then(() => {
       ).href
     );
   };
-  const agent = createAgentService(loadProviderForChat);
+  const terminalRuntime = new DesktopTerminalRuntime();
+  const agent = createAgentService(loadProviderForChat, terminalRuntime);
   registerProviderIpc(isTrustedRendererSender);
   registerChatIpc(agent, isTrustedRendererSender);
+  registerTerminalIpc(terminalRuntime, isTrustedRendererSender);
   createWindow();
 
   // On OS X it's common to re-create a window in the app when the

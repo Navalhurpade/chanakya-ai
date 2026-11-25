@@ -28,8 +28,19 @@ import {
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
-import type { Provider, ProviderKind, ProviderSettings, SaveProviderInput } from './shared/provider-contracts';
-import type { AgentEvent, ChatPromptMessage } from './shared/chat-contracts';
+import type {
+  Provider,
+  ProviderKind,
+  ProviderSettings,
+  SaveProviderInput,
+} from './shared/provider-contracts';
+import type {
+  AgentEvent,
+  ChatMode,
+  ChatPromptMessage,
+  ToolApprovalRequest,
+} from './shared/chat-contracts';
+import type { TerminalApprovalRequest } from './shared/terminal-contracts';
 import type { ChatMessage } from './stores/chat-store';
 import { useChatStore } from './stores/chat-store';
 import './index.css';
@@ -40,6 +51,9 @@ type ActiveChatRun = {
   conversationId: string;
   assistantMessageId: string;
 };
+type PendingApproval =
+  | { source: 'terminal'; request: TerminalApprovalRequest }
+  | { source: 'chat'; request: ToolApprovalRequest };
 
 const suggestions = [
   {
@@ -101,13 +115,16 @@ const initialProviderSettings: ProviderSettings = {
   providers: [],
   selectedProviderId: null,
 };
-
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Something went wrong.';
 }
 
-function getConversationTitle(conversation: { messages: ChatMessage[] } | undefined) {
-  const firstUserMessage = conversation?.messages.find((message) => message.role === 'user');
+function getConversationTitle(
+  conversation: { messages: ChatMessage[] } | undefined,
+) {
+  const firstUserMessage = conversation?.messages.find(
+    (message) => message.role === 'user',
+  );
   if (!firstUserMessage) return 'New conversation';
   return firstUserMessage.content.length > 34
     ? `${firstUserMessage.content.slice(0, 34).trim()}…`
@@ -118,33 +135,46 @@ function App() {
   const conversations = useChatStore((state) => state.conversations);
   const deleteConversation = useChatStore((state) => state.deleteConversation);
   const activeId = useChatStore((state) => state.activeId);
-  const startNewConversation = useChatStore((state) => state.startNewConversation);
+  const startNewConversation = useChatStore(
+    (state) => state.startNewConversation,
+  );
   const selectConversation = useChatStore((state) => state.selectConversation);
   const submitMessage = useChatStore((state) => state.submitMessage);
   const [searchTerm, setSearchTerm] = useState('');
   const [input, setInput] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('providers');
-  const [providerSettings, setProviderSettings] = useState<ProviderSettings>(initialProviderSettings);
+  const [providerSettings, setProviderSettings] = useState<ProviderSettings>(
+    initialProviderSettings,
+  );
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const [chatMode, setChatMode] = useState<ChatMode>('quick-assist');
   const [toast, setToast] = useState('');
   const [activeRun, setActiveRun] = useState<ActiveChatRun | null>(null);
+  const [approvalQueue, setApprovalQueue] = useState<PendingApproval[]>([]);
+  const pendingApproval = approvalQueue[0] ?? null;
   const searchRef = useRef<HTMLInputElement>(null);
   const messageRef = useRef<HTMLTextAreaElement>(null);
   const chatRef = useRef<HTMLElement>(null);
   const activeRunRef = useRef<ActiveChatRun | null>(null);
 
-  const activeConversation = conversations.find((conversation) => conversation.id === activeId);
-  const selectedProviderId = activeConversation?.providerId ?? providerSettings.selectedProviderId;
+  const activeConversation = conversations.find(
+    (conversation) => conversation.id === activeId,
+  );
+  const selectedProviderId =
+    activeConversation?.providerId ?? providerSettings.selectedProviderId;
   const selectedProvider = providerSettings.providers.find(
     (provider) => provider.id === selectedProviderId && provider.enabled,
   );
   const visibleConversations = useMemo(
     () =>
       conversations.filter((conversation) =>
-        getConversationTitle(conversation).toLowerCase().includes(searchTerm.toLowerCase()),
+        getConversationTitle(conversation)
+          .toLowerCase()
+          .includes(searchTerm.toLowerCase()),
       ),
     [conversations, searchTerm],
   );
@@ -196,24 +226,53 @@ function App() {
       const run = activeRunRef.current;
       if (!run || run.runId !== event.runId) return;
       const store = useChatStore.getState();
+      const clearApproval = () =>
+        setApprovalQueue((queue) =>
+          queue.filter((approval) => approval.request.runId !== event.runId),
+        );
       switch (event.type) {
         case 'message-started':
           break;
         case 'text-delta':
-          store.appendAssistantDelta(event.conversationId, event.assistantMessageId, event.delta);
+          store.appendAssistantDelta(
+            event.conversationId,
+            event.assistantMessageId,
+            event.delta,
+          );
+          break;
+        case 'tool-approval-requested':
+          setApprovalQueue((queue) => [
+            ...queue.filter(
+              (approval) => approval.request.approvalId !== event.approvalId,
+            ),
+            { source: 'chat', request: event },
+          ]);
           break;
         case 'message-completed':
-          store.completeAssistantMessage(event.conversationId, event.assistantMessageId);
+          clearApproval();
+          store.completeAssistantMessage(
+            event.conversationId,
+            event.assistantMessageId,
+          );
           activeRunRef.current = null;
           setActiveRun(null);
           break;
         case 'error':
-          store.failAssistantMessage(event.conversationId, event.assistantMessageId, event.message);
+          clearApproval();
+          store.failAssistantMessage(
+            event.conversationId,
+            event.assistantMessageId,
+            event.message,
+          );
           activeRunRef.current = null;
           setActiveRun(null);
           break;
         case 'generation-cancelled':
-          store.cancelAssistantMessage(event.conversationId, event.assistantMessageId);
+          clearApproval();
+          store.cancelAssistantMessage(
+            event.conversationId,
+            event.assistantMessageId,
+          );
           activeRunRef.current = null;
           setActiveRun(null);
           break;
@@ -238,6 +297,49 @@ function App() {
     };
   }, []);
 
+  useEffect(
+    () =>
+      window.chanakya.terminal.subscribeApproval((request) =>
+        setApprovalQueue((queue) => [
+          ...queue.filter(
+            (approval) => approval.request.approvalId !== request.approvalId,
+          ),
+          { source: 'terminal', request },
+        ]),
+      ),
+    [],
+  );
+
+  async function decideToolApproval(decision: 'approve' | 'deny') {
+    if (!pendingApproval) return;
+    try {
+      const settled =
+        pendingApproval.source === 'terminal'
+          ? await window.chanakya.terminal.decideApproval({
+              approvalId: pendingApproval.request.approvalId,
+              runId: pendingApproval.request.runId,
+              decision,
+            })
+          : await window.chanakya.chat.decideToolApproval({
+              approvalId: pendingApproval.request.approvalId,
+              runId: pendingApproval.request.runId,
+              decision: decision === 'approve' ? 'approved' : 'denied',
+            });
+      if (!settled) {
+        setToast('This approval request is no longer active.');
+        return;
+      }
+      setApprovalQueue((queue) =>
+        queue.filter(
+          (approval) =>
+            approval.request.approvalId !== pendingApproval.request.approvalId,
+        ),
+      );
+    } catch (error) {
+      setToast(getErrorMessage(error));
+    }
+  }
+
   async function showSettings() {
     setSettingsOpen(true);
     setSettingsLoading(true);
@@ -256,7 +358,9 @@ function App() {
       const settings = await window.chanakya.providers.select(providerId);
       setProviderSettings(settings);
       if (activeId && providerId) {
-        const provider = settings.providers.find((item) => item.id === providerId);
+        const provider = settings.providers.find(
+          (item) => item.id === providerId,
+        );
         if (provider) {
           useChatStore.getState().setConversationProvider(activeId, provider);
         }
@@ -272,7 +376,9 @@ function App() {
     if (!input.trim() || activeRunRef.current) return;
     const submitted = submitMessage(
       input,
-      selectedProvider ? { id: selectedProvider.id, model: selectedProvider.model } : null,
+      selectedProvider
+        ? { id: selectedProvider.id, model: selectedProvider.model }
+        : null,
     );
     setInput('');
     if (messageRef.current) messageRef.current.style.height = 'auto';
@@ -286,13 +392,15 @@ function App() {
     activeRunRef.current = run;
     setActiveRun(run);
     try {
-      const conversation = useChatStore.getState().conversations.find((item) => item.id === submitted.conversationId);
+      const conversation = useChatStore
+        .getState()
+        .conversations.find((item) => item.id === submitted.conversationId);
       const messages =
         conversation?.messages
           .filter(
             (message) =>
               message.id !== submitted.assistantMessageId &&
-              (message.role === 'user' || message.role === 'assistant' || message.role === 'system') &&
+              (message.role === 'user' || message.role === 'assistant') &&
               message.status !== 'error' &&
               message.status !== 'cancelled' &&
               message.content.length > 0,
@@ -305,11 +413,18 @@ function App() {
           ) ?? [];
       await window.chanakya.chat.sendMessage({
         ...run,
+        mode: chatMode,
         providerId: selectedProvider.id,
         messages,
       });
     } catch (error) {
-      useChatStore.getState().failAssistantMessage(run.conversationId, run.assistantMessageId, getErrorMessage(error));
+      useChatStore
+        .getState()
+        .failAssistantMessage(
+          run.conversationId,
+          run.assistantMessageId,
+          getErrorMessage(error),
+        );
       if (activeRunRef.current?.runId === run.runId) {
         activeRunRef.current = null;
         setActiveRun(null);
@@ -352,7 +467,11 @@ function App() {
           <span className="brand-name">
             chanakya<span className="brand-period">.</span>
           </span>
-          <button className="icon-button sidebar-collapse" aria-label="Collapse sidebar" title="Collapse sidebar">
+          <button
+            className="icon-button sidebar-collapse"
+            aria-label="Collapse sidebar"
+            title="Collapse sidebar"
+          >
             <PanelLeft size={16} />
           </button>
         </div>
@@ -389,13 +508,19 @@ function App() {
               >
                 <MessageCircle size={15} />
                 <span>{getConversationTitle(conversation)}</span>
-                <MoreHorizontal className="history-more" size={17} onClick={() => handleDeleteChat(conversation.id)} />
+                <MoreHorizontal
+                  className="history-more"
+                  size={17}
+                  onClick={() => handleDeleteChat(conversation.id)}
+                />
               </button>
             ))}
           </div>
           {visibleConversations.length === 0 && (
             <div className="history-empty">
-              {searchTerm ? 'No conversations found.' : 'Your conversations will appear here.'}
+              {searchTerm
+                ? 'No conversations found.'
+                : 'Your conversations will appear here.'}
             </div>
           )}
         </div>
@@ -415,7 +540,10 @@ function App() {
               <strong>My workspace</strong>
               <span>Local account</span>
             </div>
-            <button className="icon-button profile-menu" aria-label="Workspace menu">
+            <button
+              className="icon-button profile-menu"
+              aria-label="Workspace menu"
+            >
               <MoreHorizontal size={17} />
             </button>
           </div>
@@ -432,7 +560,11 @@ function App() {
           <div className="topbar-right">
             <div className="connection-state">
               <span className="state-dot" />
-              <span>{selectedProvider ? `Using ${selectedProvider.name}` : 'No model selected'}</span>
+              <span>
+                {selectedProvider
+                  ? `Using ${selectedProvider.name}`
+                  : 'No model selected'}
+              </span>
             </div>
             <button className="topbar-settings" onClick={showSettings}>
               <Settings size={16} />
@@ -452,7 +584,11 @@ function App() {
           ) : (
             <div className="message-list">
               {activeConversation?.messages.map((message, index) => (
-                <Message key={message.id ?? `${activeId}-${index}`} message={message} onOpenSettings={showSettings} />
+                <Message
+                  key={message.id ?? `${activeId}-${index}`}
+                  message={message}
+                  onOpenSettings={showSettings}
+                />
               ))}
             </div>
           )}
@@ -470,10 +606,59 @@ function App() {
             />
             <div className="composer-bottom">
               <div className="composer-tools">
-                <button type="button" className="composer-tool" aria-label="Attach a file" title="Attach a file">
+                <button
+                  type="button"
+                  className="mode-picker"
+                  onClick={() => setModeMenuOpen((open) => !open)}
+                  aria-haspopup="menu"
+                  aria-expanded={modeMenuOpen}
+                >
+                  <Sparkles size={13} />
+                  <span>Quick Assist</span>
+                  <ChevronDown size={14} />
+                </button>
+                {modeMenuOpen && (
+                  <div className="mode-dropdown" role="menu">
+                    <button
+                      type="button"
+                      className="mode-option active"
+                      role="menuitemradio"
+                      aria-checked={chatMode === 'quick-assist'}
+                      onClick={() => {
+                        setChatMode('quick-assist');
+                        setModeMenuOpen(false);
+                      }}
+                    >
+                      <span>Quick Assist</span>
+                      <small>Available</small>
+                    </button>
+                    <button
+                      type="button"
+                      className="mode-option"
+                      role="menuitemradio"
+                      aria-checked={false}
+                      disabled
+                      title="Agent mode is not available yet."
+                    >
+                      <span>Agent</span>
+                      <small>Coming soon</small>
+                    </button>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="composer-tool"
+                  aria-label="Attach a file"
+                  title="Attach a file"
+                >
                   <Paperclip size={16} />
                 </button>
-                <button type="button" className="composer-tool" aria-label="Web search" title="Web search">
+                <button
+                  type="button"
+                  className="composer-tool"
+                  aria-label="Web search"
+                  title="Web search"
+                >
                   <Globe size={16} />
                 </button>
                 <span className="tool-divider" />
@@ -483,9 +668,14 @@ function App() {
                   onClick={() => setModelMenuOpen((open) => !open)}
                   aria-expanded={modelMenuOpen}
                 >
-                  <Circle className={`model-dot${selectedProvider ? ' selected' : ''}`} size={8} />
+                  <Circle
+                    className={`model-dot${selectedProvider ? ' selected' : ''}`}
+                    size={8}
+                  />
                   <span>
-                    {selectedProvider ? `${selectedProvider.name} · ${selectedProvider.model}` : 'No model selected'}
+                    {selectedProvider
+                      ? `${selectedProvider.name} · ${selectedProvider.model}`
+                      : 'No model selected'}
                   </span>
                   <ChevronDown size={14} />
                 </button>
@@ -502,7 +692,9 @@ function App() {
                         >
                           <span>{provider.name}</span>
                           <small>{provider.model}</small>
-                          {provider.id === selectedProviderId && <span className="model-current">Current</span>}
+                          {provider.id === selectedProviderId && (
+                            <span className="model-current">Current</span>
+                          )}
                         </button>
                       ))}
                     <button
@@ -531,7 +723,12 @@ function App() {
                 ) : (
                   <>
                     <span className="enter-hint">Enter to send</span>
-                    <button type="submit" className="send-button" aria-label="Send message" title="Send message">
+                    <button
+                      type="submit"
+                      className="send-button"
+                      aria-label="Send message"
+                      title="Send message"
+                    >
                       <Send size={17} />
                     </button>
                   </>
@@ -539,7 +736,9 @@ function App() {
               </div>
             </div>
           </form>
-          <div className="composer-caption">Chanakya can make mistakes. Check important information.</div>
+          <div className="composer-caption">
+            Chanakya can make mistakes. Check important information.
+          </div>
         </footer>
       </main>
 
@@ -555,6 +754,49 @@ function App() {
           onSelectProvider={(providerId) => void chooseProvider(providerId)}
         />
       )}
+      {pendingApproval && (
+        <div className="terminal-approval-backdrop" role="presentation">
+          <div
+            className="terminal-approval-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Approve terminal command"
+          >
+            <div className="terminal-approval-heading">
+              <strong>Allow terminal command?</strong>
+              <span>Commands run with your user permissions.</span>
+            </div>
+            <dl className="terminal-approval-details">
+              <div>
+                <dt>Working directory</dt>
+                <dd>{pendingApproval.request.workingDirectory}</dd>
+              </div>
+              <div>
+                <dt>Command</dt>
+                <dd>
+                  <code>{pendingApproval.request.command}</code>
+                </dd>
+              </div>
+            </dl>
+            <div className="terminal-approval-actions">
+              <button
+                type="button"
+                className="terminal-deny"
+                onClick={() => void decideToolApproval('deny')}
+              >
+                Deny
+              </button>
+              <button
+                type="button"
+                className="terminal-approve"
+                onClick={() => void decideToolApproval('approve')}
+              >
+                Approve
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className={`toast${toast ? ' visible' : ''}`} role="status">
         {toast}
       </div>
@@ -562,7 +804,13 @@ function App() {
   );
 }
 
-function Welcome({ onConnect, onSuggestion }: { onConnect: () => void; onSuggestion: (prompt: string) => void }) {
+function Welcome({
+  onConnect,
+  onSuggestion,
+}: {
+  onConnect: () => void;
+  onSuggestion: (prompt: string) => void;
+}) {
   return (
     <div className="welcome">
       <div className="welcome-orb">
@@ -587,7 +835,11 @@ function Welcome({ onConnect, onSuggestion }: { onConnect: () => void; onSuggest
       </p>
       <div className="suggestion-grid">
         {suggestions.map(({ title, detail, prompt, icon: Icon, tone }) => (
-          <button className="suggestion" key={title} onClick={() => onSuggestion(prompt)}>
+          <button
+            className="suggestion"
+            key={title}
+            onClick={() => onSuggestion(prompt)}
+          >
             <span className={`suggestion-icon ${tone}`}>
               <Icon size={16} />
             </span>
@@ -604,7 +856,8 @@ function Welcome({ onConnect, onSuggestion }: { onConnect: () => void; onSuggest
           <Zap size={15} />
         </span>
         <span>
-          First time here? <strong>Connect a model provider</strong> to get started.
+          First time here? <strong>Connect a model provider</strong> to get
+          started.
         </span>
         <ArrowUpRight size={14} />
       </button>
@@ -612,7 +865,13 @@ function Welcome({ onConnect, onSuggestion }: { onConnect: () => void; onSuggest
   );
 }
 
-function Message({ message, onOpenSettings }: { message: ChatMessage; onOpenSettings: () => void }) {
+function Message({
+  message,
+  onOpenSettings,
+}: {
+  message: ChatMessage;
+  onOpenSettings: () => void;
+}) {
   if (message.role === 'user') {
     return (
       <article className="message-row user">
@@ -635,7 +894,9 @@ function Message({ message, onOpenSettings }: { message: ChatMessage; onOpenSett
       <div className="message-content">
         <div className="message-meta">
           Chanakya
-          {message.status === 'streaming' && <span className="streaming-label">Generating</span>}
+          {message.status === 'streaming' && (
+            <span className="streaming-label">Generating</span>
+          )}
         </div>
         {message.content && <p className="assistant-text">{message.content}</p>}
         {message.status === 'streaming' && !message.content && (
@@ -657,7 +918,9 @@ function Message({ message, onOpenSettings }: { message: ChatMessage; onOpenSett
             )}
           </div>
         )}
-        {message.status === 'cancelled' && <div className="generation-cancelled">{message.error}</div>}
+        {message.status === 'cancelled' && (
+          <div className="generation-cancelled">{message.error}</div>
+        )}
       </div>
     </article>
   );
@@ -713,7 +976,9 @@ function SettingsModal({
   async function updateEnabled(provider: Provider, enabled: boolean) {
     setActionError('');
     try {
-      onSettingsChange(await window.chanakya.providers.setEnabled(provider.id, enabled));
+      onSettingsChange(
+        await window.chanakya.providers.setEnabled(provider.id, enabled),
+      );
     } catch (updateError) {
       setActionError(getErrorMessage(updateError));
     }
@@ -726,13 +991,22 @@ function SettingsModal({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-heading">
+      <section
+        className="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-heading"
+      >
         <div className="modal-header">
           <div>
             <span className="modal-kicker">PREFERENCES</span>
             <h2 id="settings-heading">Settings</h2>
           </div>
-          <button className="icon-button modal-close" onClick={onClose} aria-label="Close settings">
+          <button
+            className="icon-button modal-close"
+            onClick={onClose}
+            aria-label="Close settings"
+          >
             <X size={18} />
           </button>
         </div>
@@ -754,8 +1028,9 @@ function SettingsModal({
                 <div>
                   <h3>Provider configurations</h3>
                   <p>
-                    API keys are encrypted with your operating system&apos;s secure credential storage. Saved keys are
-                    never sent back to the UI.
+                    API keys are encrypted with your operating system&apos;s
+                    secure credential storage. Saved keys are never sent back to
+                    the UI.
                   </p>
                 </div>
                 <button
@@ -769,7 +1044,9 @@ function SettingsModal({
                   <Plus size={14} /> Add provider
                 </button>
               </div>
-              {(error || actionError) && <div className="settings-error">{actionError || error}</div>}
+              {(error || actionError) && (
+                <div className="settings-error">{actionError || error}</div>
+              )}
               {loading ? (
                 <div className="settings-loading">Loading providers…</div>
               ) : settings.providers.length === 0 && !creating ? (
@@ -784,23 +1061,34 @@ function SettingsModal({
                     <div className="provider-card" key={provider.id}>
                       <div className="provider-card-main">
                         <span className={`provider-logo ${provider.kind}`}>
-                          {providerKinds.find((item) => item.kind === provider.kind)?.name.slice(0, 1) ?? 'P'}
+                          {providerKinds
+                            .find((item) => item.kind === provider.kind)
+                            ?.name.slice(0, 1) ?? 'P'}
                         </span>
                         <span className="provider-info">
                           <strong>{provider.name}</strong>
                           <small>{provider.model}</small>
                         </span>
                         <span className="provider-status">
-                          {!provider.enabled ? 'Disabled' : provider.hasApiKey ? 'Key saved' : 'No API key'}
+                          {!provider.enabled
+                            ? 'Disabled'
+                            : provider.hasApiKey
+                              ? 'Key saved'
+                              : 'No API key'}
                         </span>
                       </div>
                       <div className="provider-actions">
                         <button
                           className="provider-action"
                           onClick={() => onSelectProvider(provider.id)}
-                          disabled={!provider.enabled || settings.selectedProviderId === provider.id}
+                          disabled={
+                            !provider.enabled ||
+                            settings.selectedProviderId === provider.id
+                          }
                         >
-                          {settings.selectedProviderId === provider.id ? 'Selected' : 'Use model'}
+                          {settings.selectedProviderId === provider.id
+                            ? 'Selected'
+                            : 'Use model'}
                         </button>
                         <button
                           className="provider-action"
@@ -814,11 +1102,16 @@ function SettingsModal({
                         </button>
                         <button
                           className="provider-action"
-                          onClick={() => void updateEnabled(provider, !provider.enabled)}
+                          onClick={() =>
+                            void updateEnabled(provider, !provider.enabled)
+                          }
                         >
                           {provider.enabled ? 'Disable' : 'Enable'}
                         </button>
-                        <button className="provider-action danger" onClick={() => void removeProvider(provider.id)}>
+                        <button
+                          className="provider-action danger"
+                          onClick={() => void removeProvider(provider.id)}
+                        >
                           Remove
                         </button>
                       </div>
@@ -845,13 +1138,19 @@ function SettingsModal({
             <section className="settings-section">
               <div className="settings-intro">
                 <h3>Choose a model</h3>
-                <p>Select a configured provider and model for new conversations.</p>
+                <p>
+                  Select a configured provider and model for new conversations.
+                </p>
               </div>
               {error && <div className="settings-error">{error}</div>}
-              {settings.providers.filter((provider) => provider.enabled).length === 0 ? (
+              {settings.providers.filter((provider) => provider.enabled)
+                .length === 0 ? (
                 <div className="provider-empty">
                   <span>No enabled models yet.</span>
-                  <button className="inline-settings" onClick={() => onSelectTab('providers')}>
+                  <button
+                    className="inline-settings"
+                    onClick={() => onSelectTab('providers')}
+                  >
                     Configure a provider
                   </button>
                 </div>
@@ -870,7 +1169,9 @@ function SettingsModal({
                           <small>{provider.model}</small>
                         </span>
                         <span className="model-setting-status">
-                          {settings.selectedProviderId === provider.id ? 'Current model' : 'Select'}
+                          {settings.selectedProviderId === provider.id
+                            ? 'Current model'
+                            : 'Select'}
                         </span>
                       </button>
                     ))}
@@ -883,8 +1184,8 @@ function SettingsModal({
               <div className="settings-intro">
                 <h3>Local data</h3>
                 <p>
-                  Conversations are saved in this app on this device. Provider credentials are stored separately using
-                  OS encryption.
+                  Conversations are saved in this app on this device. Provider
+                  credentials are stored separately using OS encryption.
                 </p>
               </div>
             </section>
@@ -927,12 +1228,16 @@ function ProviderForm({
   const defaults = providerKinds.find((item) => item.kind === initialKind);
   const [kind, setKind] = useState<ProviderKind>(initialKind);
   const [name, setName] = useState(provider?.name ?? defaults?.name ?? '');
-  const [model, setModel] = useState(provider?.model ?? defaults?.defaultModel ?? '');
+  const [model, setModel] = useState(
+    provider?.model ?? defaults?.defaultModel ?? '',
+  );
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '');
   const [customHeaders, setCustomHeaders] = useState('');
   const [enabled, setEnabled] = useState(provider?.enabled ?? true);
-  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(provider?.allowPrivateNetwork ?? false);
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(
+    provider?.allowPrivateNetwork ?? false,
+  );
   const [formError, setFormError] = useState('');
 
   function changeKind(nextKind: ProviderKind) {
@@ -951,7 +1256,9 @@ function ProviderForm({
       try {
         const parsed: unknown = JSON.parse(customHeaders);
         if (!isStringRecord(parsed)) {
-          setFormError('Custom headers must be a JSON object with string values.');
+          setFormError(
+            'Custom headers must be a JSON object with string values.',
+          );
           return;
         }
         parsedHeaders = parsed;
@@ -979,16 +1286,26 @@ function ProviderForm({
     <form className="provider-form" onSubmit={submit}>
       <div className="provider-form-heading">
         <div>
-          <span className="modal-kicker">{provider ? 'EDIT PROVIDER' : 'NEW PROVIDER'}</span>
+          <span className="modal-kicker">
+            {provider ? 'EDIT PROVIDER' : 'NEW PROVIDER'}
+          </span>
           <h3>{provider ? 'Update configuration' : 'Add a provider'}</h3>
         </div>
-        <button type="button" className="icon-button modal-close" onClick={onCancel} aria-label="Close provider form">
+        <button
+          type="button"
+          className="icon-button modal-close"
+          onClick={onCancel}
+          aria-label="Close provider form"
+        >
           <X size={16} />
         </button>
       </div>
       <label className="settings-field">
         Provider
-        <select value={kind} onChange={(event) => changeKind(event.target.value as ProviderKind)}>
+        <select
+          value={kind}
+          onChange={(event) => changeKind(event.target.value as ProviderKind)}
+        >
           {providerKinds.map((option) => (
             <option value={option.kind} key={option.kind}>
               {option.name}
@@ -1039,7 +1356,9 @@ function ProviderForm({
             />
             <span>
               Allow a local/private network endpoint
-              <small>Only enable this for a self-hosted endpoint you trust.</small>
+              <small>
+                Only enable this for a self-hosted endpoint you trust.
+              </small>
             </span>
           </label>
         </>
@@ -1075,12 +1394,23 @@ function ProviderForm({
         />
       </label>
       <label className="private-network-option enabled-option">
-        <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => setEnabled(event.target.checked)}
+        />
         <span>Enable this provider</span>
       </label>
-      {(formError || error) && <div className="settings-error">{formError || error}</div>}
+      {(formError || error) && (
+        <div className="settings-error">{formError || error}</div>
+      )}
       <div className="provider-form-actions">
-        <button type="button" className="provider-action" onClick={onCancel} disabled={saving}>
+        <button
+          type="button"
+          className="provider-action"
+          onClick={onCancel}
+          disabled={saving}
+        >
           Cancel
         </button>
         <button type="submit" className="done-button" disabled={saving}>

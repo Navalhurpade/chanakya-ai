@@ -1,5 +1,5 @@
 import { ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
-import { isTerminalEvent, type AgentService } from '../agent/agent-service';
+import { isTerminalEvent, type AgentService } from '../ai/agent-service';
 import {
   acceptedChatRunSchema,
   agentEventSchema,
@@ -7,6 +7,7 @@ import {
   cancelledChatRunSchema,
   chatChannels,
   sendMessageInputSchema,
+  toolApprovalDecisionSchema,
 } from '../shared/chat-contracts';
 import { assertTrustedSender } from './provider-ipc';
 
@@ -80,6 +81,21 @@ export function registerChatIpc(
       cancelled: agent.cancelRun(runId),
     });
   });
+
+  ipcMain.handle(
+    chatChannels.decideToolApproval,
+    async (event, rawInput: unknown) => {
+      assertTrustedChatSender(event, isTrustedSender);
+      const input = toolApprovalDecisionSchema.parse(rawInput);
+      const owner = runOwners.get(input.runId);
+      if (!owner || owner.sender.id !== event.sender.id) return false;
+      return agent.decideToolApproval(
+        input.runId,
+        input.approvalId,
+        input.decision,
+      );
+    },
+  );
 }
 
 function assertTrustedChatSender(
